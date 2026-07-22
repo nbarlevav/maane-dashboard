@@ -31,8 +31,14 @@ def meta_get(path, **params):
     with urllib.request.urlopen(url, timeout=45) as r:
         return json.loads(r.read().decode())
 
+LEAD_KEYS = ("offsite_conversion.fb_pixel_lead", "lead", "onsite_web_lead")
 def leads_of(row):
-    return sum(float(a.get("value", 0)) for a in (row.get("actions") or []) if "lead" in a.get("action_type", ""))
+    # Meta reports the same conversion under several "lead" labels; count ONE, not the sum.
+    acts = {a.get("action_type"): float(a.get("value", 0)) for a in (row.get("actions") or [])}
+    for k in LEAD_KEYS:
+        if k in acts:
+            return acts[k]
+    return 0.0
 
 def agg(rows):
     spend = sum(float(r.get("spend", 0)) for r in rows)
