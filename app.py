@@ -21,6 +21,8 @@ RESEND_KEY = os.environ.get("RESEND_API_KEY", "")
 DIGEST_FROM = os.environ.get("DIGEST_FROM", "maane@barlevav.com")
 DIGEST_TO   = os.environ.get("DIGEST_TO", "")
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
+SHEET_URL   = os.environ.get("MAANE_LEADS_URL", "")
+SHEET_TOKEN = os.environ.get("MAANE_LEADS_TOKEN", "")
 
 app = Flask(__name__)
 
@@ -50,13 +52,26 @@ def agg(rows):
                 ctr=(clicks/impr*100 if impr else 0), cpc=(spend/clicks if clicks else 0),
                 cpl=(spend/leads if leads else 0))
 
+def fetch_sheet():
+    """Total leads (all sources) from the Google Sheet — display only, not used for cost math."""
+    if not (SHEET_URL and SHEET_TOKEN):
+        return None
+    try:
+        url = SHEET_URL + ("&" if "?" in SHEET_URL else "?") + urllib.parse.urlencode({"token": SHEET_TOKEN})
+        with urllib.request.urlopen(url, timeout=20) as r:
+            d = json.loads(r.read().decode())
+        return d if d.get("ok") else None
+    except Exception:
+        return None
+
 def fetch():
     try:
         rows = meta_get(f"{CAMP}/insights", level="ad", date_preset="maximum",
                         fields="spend,impressions,clicks,reach,actions,ad_name,adset_name").get("data", [])
+        err = None
     except Exception as e:
-        return {"error": str(e)[:200], "ad_rows": []}
-    return {"error": None, "ad_rows": rows}
+        rows, err = [], str(e)[:200]
+    return {"error": err, "ad_rows": rows, "sheet": fetch_sheet()}
 
 # ---------- render ----------
 def fnum(x, d=0):
@@ -105,21 +120,26 @@ def render(data):
     tot = agg(ad_rows)
     updated = datetime.now(JER).strftime("%Y-%m-%d %H:%M")
     err = data.get("error")
+    sheet = data.get("sheet")
+    total_leads = sheet.get("total") if sheet else None
+    registered  = sheet.get("registered") if sheet else None
     def kpi(l, v, s=""): return f'<div class="kpi"><div class="klabel">{l}</div><div class="kval">{v}</div><div class="ksub">{s}</div></div>'
+    total_sub = "all sources" + (f" · {int(registered)} registered" if registered is not None else "")
     kpis = "".join([
         kpi("Spend", "₪"+fnum(tot["spend"],0), f'of ₪{BUDGET:,} budget'),
-        kpi("Leads", fnum(tot["leads"],0), f'goal {GOAL}'),
-        kpi("Cost / Lead", ("₪"+fnum(tot["cpl"],0)) if tot["leads"] else "—", "the number to watch"),
+        kpi("Ad-attributed leads", fnum(tot["leads"],0), "matched to ads by Meta"),
+        kpi("Total leads", (fnum(total_leads,0) if total_leads is not None else "—"), total_sub),
+        kpi("Cost / Lead", ("₪"+fnum(tot["cpl"],0)) if tot["leads"] else "—", "per ad-attributed lead"),
         kpi("Impressions", fnum(tot["impr"],0), f'reach {fnum(tot["reach"],0)}'),
-        kpi("Clicks", fnum(tot["clicks"],0), f'CTR {fnum(tot["ctr"],2)}%'),
-        kpi("Cost / Click", ("₪"+fnum(tot["cpc"],2)) if tot["clicks"] else "—", ""),
+        kpi("Clicks", fnum(tot["clicks"],0), f'CTR {fnum(tot["ctr"],2)}% · CPC ₪{fnum(tot["cpc"],2)}'),
     ])
     groups = defaultdict(list)
     for r in ad_rows: groups[r.get("adset_name","?")].append(r)
     adset_html = "".join(row_cells(n, rs) for n, rs in groups.items()) or '<tr><td colspan="6" class="empty">No delivery yet — fills in shortly.</td></tr>'
     ad_html = "".join(row_cells(r.get("ad_name","?"), [r]) for r in ad_rows) or '<tr><td colspan="6" class="empty">No delivery yet.</td></tr>'
+    leads_goal = total_leads if total_leads is not None else tot["leads"]
     pb = min(100, tot["spend"]/BUDGET*100) if BUDGET else 0
-    pg = min(100, tot["leads"]/GOAL*100) if GOAL else 0
+    pg = min(100, leads_goal/GOAL*100) if GOAL else 0
     errbanner = f'<div class="note"><b>Note:</b> couldn\'t reach Meta just now ({err}). Showing last good render; retry on reload.</div>' if err else ""
     return f"""<!doctype html><html lang="en"><head><title>Machon Maane — Campaign Dashboard</title>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -131,11 +151,11 @@ def render(data):
 <div class="kpis">{kpis}</div>
 <div class="bars">
 <div class="bar"><div class="t">Budget spent · ₪{fnum(tot['spend'],0)} of ₪{BUDGET:,}</div><div class="track"><div class="fill" style="width:{pb:.1f}%"></div></div></div>
-<div class="bar"><div class="t">Leads · {fnum(tot['leads'],0)} of {GOAL} goal</div><div class="track"><div class="fill go" style="width:{pg:.1f}%"></div></div></div>
+<div class="bar"><div class="t">Leads · {fnum(leads_goal,0)} of {GOAL} goal · all sources</div><div class="track"><div class="fill go" style="width:{pg:.1f}%"></div></div></div>
 </div>
 <h2>By audience</h2><div class="tablewrap"><table><thead><tr><th>Audience</th><th>Spend</th><th>Leads</th><th>Cost/Lead</th><th>Impr.</th><th>CTR</th></tr></thead><tbody>{adset_html}</tbody></table></div>
 <h2>By ad (which creative wins)</h2><div class="tablewrap"><table><thead><tr><th>Ad</th><th>Spend</th><th>Leads</th><th>Cost/Lead</th><th>Impr.</th><th>CTR</th></tr></thead><tbody>{ad_html}</tbody></table></div>
-<div class="note"><b>How to read this:</b> watch <b>Cost per Lead</b>. A "lead" here is a form submission — a woman to call. Whether she registers for a class (the real conversion for now) is tracked in the leads sheet after the call; paying comes when the next class opens. Once each ad has ~15–20 leads we pause the weak ones and back the winner.</div>
+<div class="note"><b>How to read this:</b> <b>Total leads</b> is every form submission — your real count, from the sheet. <b>Ad-attributed leads</b> is the subset Meta can trace back to an ad; it's normally lower, and it's what <b>Cost per Lead</b> is based on (the fair measure of ad performance). <b>Registered</b> = leads Aya marked as signed up for a class. Once each ad has enough leads we pause the weak ones and back the winner.</div>
 <p class="foot">Live from the Meta Marketing API · Machon Maane campaign dashboard</p>
 </div></body></html>"""
 
@@ -160,16 +180,19 @@ def healthz():
 # ---------- daily digest ----------
 def send_digest():
     if not (RESEND_KEY and DIGEST_TO): return
-    tot = agg(fetch()["ad_rows"])
+    data = fetch(); tot = agg(data["ad_rows"])
+    total_leads = (data.get("sheet") or {}).get("total")
     d = datetime.now(JER).strftime("%d/%m/%Y")
     cpl = ("₪"+fnum(tot["cpl"],0)) if tot["leads"] else "—"
+    tl = fnum(total_leads,0) if total_leads is not None else "—"
     html = (f'<div style="font-family:Arial,sans-serif;color:#3A322A;max-width:520px">'
             f'<h2 style="color:#8A6D38;font-weight:normal">מכון מענה · סיכום קמפיין יומי</h2>'
             f'<p style="color:#8A7C68">{d}</p>'
             f'<table style="width:100%;border-collapse:collapse;font-size:15px">'
             f'<tr><td>הוצאה</td><td style="text-align:left"><b>₪{fnum(tot["spend"],0)}</b> מתוך ₪{BUDGET:,}</td></tr>'
-            f'<tr><td>לידים</td><td style="text-align:left"><b>{fnum(tot["leads"],0)}</b> מתוך {GOAL}</td></tr>'
-            f'<tr><td>עלות לליד</td><td style="text-align:left"><b>{cpl}</b></td></tr>'
+            f'<tr><td>לידים (סה״כ)</td><td style="text-align:left"><b>{tl}</b> מתוך {GOAL}</td></tr>'
+            f'<tr><td>מתוכם משויכים לפרסום</td><td style="text-align:left">{fnum(tot["leads"],0)}</td></tr>'
+            f'<tr><td>עלות לליד (פרסום)</td><td style="text-align:left"><b>{cpl}</b></td></tr>'
             f'<tr><td>חשיפות</td><td style="text-align:left">{fnum(tot["impr"],0)} · CTR {fnum(tot["ctr"],2)}%</td></tr>'
             f'</table><p style="margin-top:18px"><a href="https://maane.barlevav.com" style="color:#B08D4F">לדשבורד המלא ←</a></p></div>')
     body = json.dumps({"from": DIGEST_FROM, "to": [DIGEST_TO],
