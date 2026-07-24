@@ -6,6 +6,7 @@ All secrets come from environment variables.
 import os, time, json, threading, urllib.request, urllib.parse
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 from flask import Flask, Response
 
 V = "v23.0"
@@ -15,7 +16,7 @@ CAMP    = os.environ["MAANE_CAMPAIGN_ID"]
 BUDGET  = int(os.environ.get("VALIDATION_BUDGET", "1500"))
 GOAL    = int(os.environ.get("LEAD_GOAL", "200"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "180"))          # seconds
-JER = timezone(timedelta(hours=3))
+JER = ZoneInfo("Asia/Jerusalem")   # correct Israel local time incl. daylight saving
 
 RESEND_KEY = os.environ.get("RESEND_API_KEY", "")
 DIGEST_FROM = os.environ.get("DIGEST_FROM", "maane@barlevav.com")
@@ -266,6 +267,69 @@ def digest_loop():
 
 if os.environ.get("ENABLE_DIGEST", "1") == "1":
     threading.Thread(target=digest_loop, daemon=True).start()
+
+# ---------- Shabbat auto-pause ----------
+SHABBAT_PAUSE_HOUR  = int(os.environ.get("SHABBAT_PAUSE_HOUR", "15"))    # Friday, Israel time
+SHABBAT_RESUME_HOUR = int(os.environ.get("SHABBAT_RESUME_HOUR", "21"))   # Saturday, Israel time
+_SHABBAT_STATE = "/app/.shabbat_state"
+
+def _in_shabbat_window(now):
+    wd = now.weekday()                       # Mon=0 … Fri=4, Sat=5, Sun=6
+    if wd == 4: return now.hour >= SHABBAT_PAUSE_HOUR
+    if wd == 5: return now.hour <  SHABBAT_RESUME_HOUR
+    return False
+
+def _meta_set(status):
+    data = urllib.parse.urlencode({"status": status, "access_token": TOKEN}).encode()
+    urllib.request.urlopen(urllib.request.Request(f"https://graph.facebook.com/{V}/{CAMP}", data=data), timeout=30)
+
+def _google_set(status):
+    if not (GADS["dev"] and GADS["refresh"] and GADS["cust"]): return
+    body = urllib.parse.urlencode({"client_id": GADS["cid"], "client_secret": GADS["secret"],
+            "refresh_token": GADS["refresh"], "grant_type": "refresh_token"}).encode()
+    at = json.loads(urllib.request.urlopen("https://oauth2.googleapis.com/token", data=body, timeout=20).read().decode())["access_token"]
+    hdr = {"Authorization": "Bearer " + at, "developer-token": GADS["dev"], "login-customer-id": GADS["login"], "Content-Type": "application/json"}
+    base = f"https://googleads.googleapis.com/{GADS_VER}/customers/{GADS['cust']}"
+    q = json.dumps({"query": "SELECT campaign.resource_name FROM campaign"}).encode()
+    data = json.loads(urllib.request.urlopen(urllib.request.Request(base + "/googleAds:searchStream", data=q, headers=hdr), timeout=30).read().decode())
+    for batch in data:
+        for r in batch.get("results", []):
+            rn = r["campaign"]["resourceName"]
+            op = json.dumps({"operations": [{"updateMask": "status", "update": {"resourceName": rn, "status": status}}]}).encode()
+            urllib.request.urlopen(urllib.request.Request(base + "/campaigns:mutate", data=op, headers=hdr), timeout=30)
+
+def _set_campaigns(active):
+    try: _meta_set("ACTIVE" if active else "PAUSED")
+    except Exception: pass
+    try: _google_set("ENABLED" if active else "PAUSED")
+    except Exception: pass
+
+def _read_flag():
+    try:
+        with open(_SHABBAT_STATE) as f: return json.load(f) is True
+    except Exception: return False
+
+def _write_flag(v):
+    try:
+        with open(_SHABBAT_STATE, "w") as f: json.dump(v, f)
+    except Exception: pass
+
+def shabbat_loop():
+    # Pause both campaigns for Shabbat and resume after. Only resumes what IT paused.
+    paused = _read_flag()
+    while True:
+        try:
+            want = _in_shabbat_window(datetime.now(JER))
+            if want and not paused:
+                _set_campaigns(False); paused = True; _write_flag(True)
+            elif (not want) and paused:
+                _set_campaigns(True);  paused = False; _write_flag(False)
+        except Exception:
+            pass
+        time.sleep(300)
+
+if os.environ.get("ENABLE_SHABBAT_PAUSE", "1") == "1":
+    threading.Thread(target=shabbat_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
