@@ -23,6 +23,15 @@ DIGEST_TO   = os.environ.get("DIGEST_TO", "")
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 SHEET_URL   = os.environ.get("MAANE_LEADS_URL", "")
 SHEET_TOKEN = os.environ.get("MAANE_LEADS_TOKEN", "")
+GADS = {
+    "dev":     os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", ""),
+    "cid":     os.environ.get("GOOGLE_ADS_CLIENT_ID", ""),
+    "secret":  os.environ.get("GOOGLE_ADS_CLIENT_SECRET", ""),
+    "refresh": os.environ.get("GOOGLE_ADS_REFRESH_TOKEN", ""),
+    "login":   os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", ""),
+    "cust":    os.environ.get("GOOGLE_ADS_CUSTOMER_ID", ""),
+}
+GADS_VER = "v21"
 
 app = Flask(__name__)
 
@@ -64,6 +73,30 @@ def fetch_sheet():
     except Exception:
         return None
 
+def fetch_google():
+    """Google Search campaign totals via the Google Ads API (v21)."""
+    if not (GADS["dev"] and GADS["refresh"] and GADS["cust"]):
+        return None
+    try:
+        body = urllib.parse.urlencode({"client_id": GADS["cid"], "client_secret": GADS["secret"],
+                "refresh_token": GADS["refresh"], "grant_type": "refresh_token"}).encode()
+        at = json.loads(urllib.request.urlopen("https://oauth2.googleapis.com/token", data=body, timeout=20).read().decode())["access_token"]
+        q = json.dumps({"query": "SELECT metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign"}).encode()
+        url = f"https://googleads.googleapis.com/{GADS_VER}/customers/{GADS['cust']}/googleAds:searchStream"
+        req = urllib.request.Request(url, data=q, headers={"Authorization": "Bearer " + at,
+                "developer-token": GADS["dev"], "login-customer-id": GADS["login"], "Content-Type": "application/json"})
+        data = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+        spend = impr = clicks = conv = 0.0
+        for batch in data:
+            for r in batch.get("results", []):
+                m = r.get("metrics", {})
+                impr += float(m.get("impressions", 0)); clicks += float(m.get("clicks", 0))
+                spend += int(m.get("costMicros", 0)) / 1_000_000; conv += float(m.get("conversions", 0))
+        return {"spend": spend, "impr": impr, "clicks": clicks, "conv": conv,
+                "cpc": (spend / clicks if clicks else 0), "cpl": (spend / conv if conv else 0)}
+    except Exception:
+        return None
+
 def fetch():
     try:
         rows = meta_get(f"{CAMP}/insights", level="ad", date_preset="maximum",
@@ -71,7 +104,7 @@ def fetch():
         err = None
     except Exception as e:
         rows, err = [], str(e)[:200]
-    return {"error": err, "ad_rows": rows, "sheet": fetch_sheet()}
+    return {"error": err, "ad_rows": rows, "sheet": fetch_sheet(), "google": fetch_google()}
 
 # ---------- render ----------
 def fnum(x, d=0):
@@ -141,13 +174,28 @@ def render(data):
     pb = min(100, tot["spend"]/BUDGET*100) if BUDGET else 0
     pg = min(100, leads_goal/GOAL*100) if GOAL else 0
     errbanner = f'<div class="note"><b>Note:</b> couldn\'t reach Meta just now ({err}). Showing last good render; retry on reload.</div>' if err else ""
+    g = data.get("google")
+    if g:
+        gkpis = "".join([
+            kpi("Spend", "₪"+fnum(g["spend"],0), "Google Search"),
+            kpi("Clicks", fnum(g["clicks"],0), f'CPC ₪{fnum(g["cpc"],2)}'),
+            kpi("Conversions", fnum(g["conv"],0), "Search form submits"),
+            kpi("Cost / Conv.", ("₪"+fnum(g["cpl"],0)) if g["conv"] else "—", "per Search lead"),
+            kpi("Impressions", fnum(g["impr"],0), ""),
+        ])
+        google_section = f'<h2>Google Search</h2><div class="kpis">{gkpis}</div>'
+        combined = tot["spend"] + g["spend"]
+    else:
+        google_section = '<h2>Google Search</h2><div class="note">No Google data yet (just launched or briefly unavailable) — fills in shortly.</div>'
+        combined = tot["spend"]
     return f"""<!doctype html><html lang="en"><head><title>Machon Maane — Campaign Dashboard</title>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="180">{CSS}</head><body><div class="wrap">
 <p class="eyebrow">Live Campaign · Validation Round</p>
 <h1>Machon Maane — Leads Dashboard<span class="status">● LIVE</span></h1>
-<p class="meta">Facebook + Instagram · optimizing for form submissions · auto-refreshes every 3 min · updated {updated} (Israel time)</p>
+<p class="meta">Facebook/Instagram + Google Search · optimizing for form submissions · auto-refreshes every 3 min · updated {updated} (Israel time)</p>
 {errbanner}
+<h2 style="margin-top:6px">Facebook / Instagram</h2>
 <div class="kpis">{kpis}</div>
 <div class="bars">
 <div class="bar"><div class="t">Budget spent · ₪{fnum(tot['spend'],0)} of ₪{BUDGET:,}</div><div class="track"><div class="fill" style="width:{pb:.1f}%"></div></div></div>
@@ -155,8 +203,9 @@ def render(data):
 </div>
 <h2>By audience</h2><div class="tablewrap"><table><thead><tr><th>Audience</th><th>Spend</th><th>Leads</th><th>Cost/Lead</th><th>Impr.</th><th>CTR</th></tr></thead><tbody>{adset_html}</tbody></table></div>
 <h2>By ad (which creative wins)</h2><div class="tablewrap"><table><thead><tr><th>Ad</th><th>Spend</th><th>Leads</th><th>Cost/Lead</th><th>Impr.</th><th>CTR</th></tr></thead><tbody>{ad_html}</tbody></table></div>
+{google_section}
 <div class="note"><b>How to read this:</b> <b>Total leads</b> is every form submission — your real count, from the sheet. <b>Ad-attributed leads</b> is the subset Meta can trace back to an ad; it's normally lower, and it's what <b>Cost per Lead</b> is based on (the fair measure of ad performance). <b>Registered</b> = leads Aya marked as signed up for a class. Once each ad has enough leads we pause the weak ones and back the winner.</div>
-<p class="foot">Live from the Meta Marketing API · Machon Maane campaign dashboard</p>
+<p class="foot">Total spend across channels: ₪{fnum(combined,0)} · live from the Meta + Google Ads APIs</p>
 </div></body></html>"""
 
 # ---------- cache ----------
@@ -182,6 +231,8 @@ def send_digest():
     if not (RESEND_KEY and DIGEST_TO): return
     data = fetch(); tot = agg(data["ad_rows"])
     total_leads = (data.get("sheet") or {}).get("total")
+    g = data.get("google")
+    grow = (f'<tr><td>גוגל (הוצאה · קליקים · המרות)</td><td style="text-align:left">₪{fnum(g["spend"],0)} · {fnum(g["clicks"],0)} · {fnum(g["conv"],0)}</td></tr>') if g else ''
     d = datetime.now(JER).strftime("%d/%m/%Y")
     cpl = ("₪"+fnum(tot["cpl"],0)) if tot["leads"] else "—"
     tl = fnum(total_leads,0) if total_leads is not None else "—"
@@ -193,7 +244,8 @@ def send_digest():
             f'<tr><td>לידים (סה״כ)</td><td style="text-align:left"><b>{tl}</b> מתוך {GOAL}</td></tr>'
             f'<tr><td>מתוכם משויכים לפרסום</td><td style="text-align:left">{fnum(tot["leads"],0)}</td></tr>'
             f'<tr><td>עלות לליד (פרסום)</td><td style="text-align:left"><b>{cpl}</b></td></tr>'
-            f'<tr><td>חשיפות</td><td style="text-align:left">{fnum(tot["impr"],0)} · CTR {fnum(tot["ctr"],2)}%</td></tr>'
+            f'<tr><td>חשיפות (פייסבוק)</td><td style="text-align:left">{fnum(tot["impr"],0)} · CTR {fnum(tot["ctr"],2)}%</td></tr>'
+            f'{grow}'
             f'</table><p style="margin-top:18px"><a href="https://maane.barlevav.com" style="color:#B08D4F">לדשבורד המלא ←</a></p></div>')
     body = json.dumps({"from": DIGEST_FROM, "to": [DIGEST_TO],
                        "subject": f"מכון מענה · סיכום קמפיין {d}", "html": html}).encode()
