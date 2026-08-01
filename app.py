@@ -13,7 +13,7 @@ V = "v23.0"
 TOKEN   = os.environ["META_ACCESS_TOKEN"]
 ACCT    = os.environ["META_AD_ACCOUNT_ID"]
 CAMP    = os.environ["MAANE_CAMPAIGN_ID"]
-BUDGET  = int(os.environ.get("VALIDATION_BUDGET", "1500"))
+MONTHLY_BUDGET = int(os.environ.get("MONTHLY_BUDGET", "5000"))   # ILS/month, both channels
 GOAL    = int(os.environ.get("LEAD_GOAL", "200"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "180"))          # seconds
 JER = ZoneInfo("Asia/Jerusalem")   # correct Israel local time incl. daylight saving
@@ -98,6 +98,30 @@ def fetch_google():
     except Exception:
         return None
 
+def fetch_month():
+    """Month-to-date spend, Meta + Google, for burn-rate pacing."""
+    meta_m = google_m = 0.0
+    try:
+        d = meta_get(f"{CAMP}/insights", date_preset="this_month", fields="spend").get("data", [])
+        if d: meta_m = float(d[0].get("spend", 0))
+    except Exception:
+        pass
+    try:
+        if GADS["dev"] and GADS["refresh"]:
+            body = urllib.parse.urlencode({"client_id": GADS["cid"], "client_secret": GADS["secret"],
+                    "refresh_token": GADS["refresh"], "grant_type": "refresh_token"}).encode()
+            at = json.loads(urllib.request.urlopen("https://oauth2.googleapis.com/token", data=body, timeout=20).read().decode())["access_token"]
+            q = json.dumps({"query": "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING THIS_MONTH"}).encode()
+            url = f"https://googleads.googleapis.com/{GADS_VER}/customers/{GADS['cust']}/googleAds:searchStream"
+            req = urllib.request.Request(url, data=q, headers={"Authorization": "Bearer " + at,
+                    "developer-token": GADS["dev"], "login-customer-id": GADS["login"], "Content-Type": "application/json"})
+            for batch in json.loads(urllib.request.urlopen(req, timeout=30).read().decode()):
+                for r in batch.get("results", []):
+                    google_m += int(r.get("metrics", {}).get("costMicros", 0)) / 1_000_000
+    except Exception:
+        pass
+    return {"meta": meta_m, "google": google_m, "total": meta_m + google_m}
+
 def fetch():
     try:
         rows = meta_get(f"{CAMP}/insights", level="ad", date_preset="maximum",
@@ -105,7 +129,7 @@ def fetch():
         err = None
     except Exception as e:
         rows, err = [], str(e)[:200]
-    return {"error": err, "ad_rows": rows, "sheet": fetch_sheet(), "google": fetch_google()}
+    return {"error": err, "ad_rows": rows, "sheet": fetch_sheet(), "google": fetch_google(), "month": fetch_month()}
 
 # ---------- render ----------
 def fnum(x, d=0):
@@ -160,7 +184,7 @@ def render(data):
     def kpi(l, v, s=""): return f'<div class="kpi"><div class="klabel">{l}</div><div class="kval">{v}</div><div class="ksub">{s}</div></div>'
     total_sub = "all sources" + (f" · {int(registered)} registered" if registered is not None else "")
     kpis = "".join([
-        kpi("Spend", "₪"+fnum(tot["spend"],0), f'of ₪{BUDGET:,} budget'),
+        kpi("Spend", "₪"+fnum(tot["spend"],0), f'lifetime · ₪{fnum((data.get("month") or {}).get("total",0),0)} this month'),
         kpi("Ad-attributed leads", fnum(tot["leads"],0), "matched to ads by Meta"),
         kpi("Total leads", (fnum(total_leads,0) if total_leads is not None else "—"), total_sub),
         kpi("Cost / Lead", ("₪"+fnum(tot["cpl"],0)) if tot["leads"] else "—", "per ad-attributed lead"),
@@ -172,7 +196,11 @@ def render(data):
     adset_html = "".join(row_cells(n, rs) for n, rs in groups.items()) or '<tr><td colspan="6" class="empty">No delivery yet — fills in shortly.</td></tr>'
     ad_html = "".join(row_cells(r.get("ad_name","?"), [r]) for r in ad_rows) or '<tr><td colspan="6" class="empty">No delivery yet.</td></tr>'
     leads_goal = total_leads if total_leads is not None else tot["leads"]
-    pb = min(100, tot["spend"]/BUDGET*100) if BUDGET else 0
+    now = datetime.now(JER)
+    import calendar
+    month_total = (data.get("month") or {}).get("total", 0)
+    month_pace = month_total / max(1, now.day) * calendar.monthrange(now.year, now.month)[1]
+    pb = min(100, month_total/MONTHLY_BUDGET*100) if MONTHLY_BUDGET else 0
     pg = min(100, leads_goal/GOAL*100) if GOAL else 0
     errbanner = f'<div class="note"><b>Note:</b> couldn\'t reach Meta just now ({err}). Showing last good render; retry on reload.</div>' if err else ""
     g = data.get("google")
@@ -192,14 +220,14 @@ def render(data):
     return f"""<!doctype html><html lang="en"><head><title>Machon Maane — Campaign Dashboard</title>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="180">{CSS}</head><body><div class="wrap">
-<p class="eyebrow">Live Campaign · Validation Round</p>
+<p class="eyebrow">Live Campaign · Meta + Google</p>
 <h1>Machon Maane — Leads Dashboard<span class="status">● LIVE</span></h1>
 <p class="meta">Facebook/Instagram + Google Search · optimizing for form submissions · auto-refreshes every 3 min · updated {updated} (Israel time)</p>
 {errbanner}
 <h2 style="margin-top:6px">Facebook / Instagram</h2>
 <div class="kpis">{kpis}</div>
 <div class="bars">
-<div class="bar"><div class="t">Budget spent · ₪{fnum(tot['spend'],0)} of ₪{BUDGET:,}</div><div class="track"><div class="fill" style="width:{pb:.1f}%"></div></div></div>
+<div class="bar"><div class="t">This month · ₪{fnum(month_total,0)} of ₪{MONTHLY_BUDGET:,} · on pace for ~₪{fnum(month_pace,0)}</div><div class="track"><div class="fill" style="width:{pb:.1f}%"></div></div></div>
 <div class="bar"><div class="t">Leads · {fnum(leads_goal,0)} of {GOAL} goal · all sources</div><div class="track"><div class="fill go" style="width:{pg:.1f}%"></div></div></div>
 </div>
 <h2>By audience</h2><div class="tablewrap"><table><thead><tr><th>Audience</th><th>Spend</th><th>Leads</th><th>Cost/Lead</th><th>Impr.</th><th>CTR</th></tr></thead><tbody>{adset_html}</tbody></table></div>
@@ -232,6 +260,10 @@ def send_digest():
     if not (RESEND_KEY and DIGEST_TO): return
     data = fetch(); tot = agg(data["ad_rows"])
     total_leads = (data.get("sheet") or {}).get("total")
+    mon = data.get("month") or {"total": 0}
+    import calendar as _cal
+    _now = datetime.now(JER)
+    mon_pace = mon["total"] / max(1, _now.day) * _cal.monthrange(_now.year, _now.month)[1]
     g = data.get("google")
     grow = (f'<tr><td>גוגל (הוצאה · קליקים · המרות)</td><td style="text-align:left">₪{fnum(g["spend"],0)} · {fnum(g["clicks"],0)} · {fnum(g["conv"],0)}</td></tr>') if g else ''
     d = datetime.now(JER).strftime("%d/%m/%Y")
@@ -241,7 +273,7 @@ def send_digest():
             f'<h2 style="color:#8A6D38;font-weight:normal">מכון מענה · סיכום קמפיין יומי</h2>'
             f'<p style="color:#8A7C68">{d}</p>'
             f'<table style="width:100%;border-collapse:collapse;font-size:15px">'
-            f'<tr><td>הוצאה</td><td style="text-align:left"><b>₪{fnum(tot["spend"],0)}</b> מתוך ₪{BUDGET:,}</td></tr>'
+            f'<tr><td>הוצאה החודש (שני הערוצים)</td><td style="text-align:left"><b>₪{fnum(mon["total"],0)}</b> מתוך ₪{MONTHLY_BUDGET:,} · בקצב ~₪{fnum(mon_pace,0)}</td></tr>'
             f'<tr><td>לידים (סה״כ)</td><td style="text-align:left"><b>{tl}</b> מתוך {GOAL}</td></tr>'
             f'<tr><td>מתוכם משויכים לפרסום</td><td style="text-align:left">{fnum(tot["leads"],0)}</td></tr>'
             f'<tr><td>עלות לליד (פרסום)</td><td style="text-align:left"><b>{cpl}</b></td></tr>'
