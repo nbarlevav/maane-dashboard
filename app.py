@@ -300,15 +300,30 @@ def digest_loop():
 if os.environ.get("ENABLE_DIGEST", "1") == "1":
     threading.Thread(target=digest_loop, daemon=True).start()
 
-# ---------- Shabbat auto-pause ----------
+# ---------- Campaign schedule automation ----------
+# CAMPAIGN_SCHEDULE modes:
+#   'weekend_window' (default): campaigns OFF all week; META ONLY runs Sat WINDOW_START
+#       -> Sun WINDOW_END (Motzaei Shabbat burst; <7-day gaps keep Meta learning warm).
+#       Google is never touched in this mode (stays as manually set).
+#   'shabbat': legacy — both platforms run all week except Fri SHABBAT_PAUSE -> Sat SHABBAT_RESUME.
+#   'off': no automation.
+CAMPAIGN_SCHEDULE   = os.environ.get("CAMPAIGN_SCHEDULE", "weekend_window")
 SHABBAT_PAUSE_HOUR  = int(os.environ.get("SHABBAT_PAUSE_HOUR", "15"))    # Friday, Israel time
 SHABBAT_RESUME_HOUR = int(os.environ.get("SHABBAT_RESUME_HOUR", "21"))   # Saturday, Israel time
+WINDOW_START_HOUR   = int(os.environ.get("WINDOW_START_HOUR", "21"))     # Saturday, Israel time
+WINDOW_END_HOUR     = int(os.environ.get("WINDOW_END_HOUR", "9"))        # Sunday, Israel time
 _SHABBAT_STATE = "/app/.shabbat_state"
 
 def _in_shabbat_window(now):
     wd = now.weekday()                       # Mon=0 … Fri=4, Sat=5, Sun=6
     if wd == 4: return now.hour >= SHABBAT_PAUSE_HOUR
     if wd == 5: return now.hour <  SHABBAT_RESUME_HOUR
+    return False
+
+def _in_weekend_window(now):
+    wd = now.weekday()
+    if wd == 5: return now.hour >= WINDOW_START_HOUR    # Saturday night
+    if wd == 6: return now.hour <  WINDOW_END_HOUR      # Sunday morning
     return False
 
 def _meta_set(status):
@@ -347,7 +362,7 @@ def _write_flag(v):
     except Exception: pass
 
 def shabbat_loop():
-    # Pause both campaigns for Shabbat and resume after. Only resumes what IT paused.
+    # Legacy mode: pause both campaigns for Shabbat and resume after.
     paused = _read_flag()
     while True:
         try:
@@ -360,7 +375,24 @@ def shabbat_loop():
             pass
         time.sleep(300)
 
-if os.environ.get("ENABLE_SHABBAT_PAUSE", "1") == "1":
+def weekend_window_loop():
+    # Meta runs ONLY during the Sat-night window; off the rest of the week.
+    # Flag file records "campaign is on". Missing flag = assumed off.
+    is_on = _read_flag()
+    while True:
+        try:
+            want_on = _in_weekend_window(datetime.now(JER))
+            if want_on and not is_on:
+                _meta_set("ACTIVE"); is_on = True;  _write_flag(True)
+            elif (not want_on) and is_on:
+                _meta_set("PAUSED"); is_on = False; _write_flag(False)
+        except Exception:
+            pass
+        time.sleep(300)
+
+if CAMPAIGN_SCHEDULE == "weekend_window":
+    threading.Thread(target=weekend_window_loop, daemon=True).start()
+elif CAMPAIGN_SCHEDULE == "shabbat" and os.environ.get("ENABLE_SHABBAT_PAUSE", "1") == "1":
     threading.Thread(target=shabbat_loop, daemon=True).start()
 
 if __name__ == "__main__":
